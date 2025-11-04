@@ -174,7 +174,13 @@ for ((i=START;i<=END;i++)); do
 
   # prepare commit message and create commit with parent = base commit
   COMMIT_MSG_ACTUAL="${COMMIT_MSG//\{\{BRANCH\}\}/$BR}"
-  COMMIT_HASH=$(echo "$COMMIT_MSG_ACTUAL" | git commit-tree "$TREE_HASH" -p "$BASE_COMMIT" --author="$AUTHOR_NAME <$AUTHOR_EMAIL>")
+
+  # create commit with proper author/committer env vars
+  GIT_AUTHOR_NAME="$AUTHOR_NAME" \
+  GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" \
+  GIT_COMMITTER_NAME="$AUTHOR_NAME" \
+  GIT_COMMITTER_EMAIL="$AUTHOR_EMAIL" \
+  COMMIT_HASH=$(echo "$COMMIT_MSG_ACTUAL" | git commit-tree "$TREE_HASH" -p "$BASE_COMMIT")
 
   # create branch ref pointing to new commit
   git update-ref "refs/heads/$BR" "$COMMIT_HASH"

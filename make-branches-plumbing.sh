@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# make-branches-with-retry.sh
-# Create many dummy branches from a base branch, make a unique commit on each,
-# and reliably push branches to remote with retries. If a previous run created
-# branches locally but failed to push them, re-running with --push will
-# attempt to push those existing local branches as well.
+# make-branches-plumbing.sh
+# Create many dummy branches from a base branch and make a unique commit on each,
+# without checking out branches (no working-tree switches). Pushes with retries.
 #
-# Usage examples:
-#  ./make-branches-with-retry.sh -n 200 --push
-#  ./make-branches-with-retry.sh -n 50 -p feat/ -s 101 --push --batch 10 --delay 2 --retries 5
+# Usage:
+#  ./make-branches-plumbing.sh -n 200 --push
+#  ./make-branches-plumbing.sh -n 50 -p feat/ -s 101 --push --retries 5 --delay 2
 #
-# IMPORTANT: Run from a clean working tree (no uncommitted changes).
+# WARNING: This manipulates refs and objects directly (safe when used responsibly).
+# IMPORTANT: Run from repo root. A clean working tree is NOT strictly required because we never switch,
+# but avoid running on a repo with concurrent git processes to be safe.
 
 NUM=200
 PREFIX="dummy-"
@@ -24,9 +24,9 @@ INFO_FILE=".branch-info"
 COMMIT_MSG="chore: add branch metadata {{BRANCH}}"
 AUTHOR_NAME="Test Bot"
 AUTHOR_EMAIL="test@example.com"
-RETRIES=3        # attempts for pushing a single branch
-DELAY=1          # seconds to wait between pushes (and between retries)
-BATCH=20         # number of pushes after which we sleep a bit more
+RETRIES=3
+DELAY=1
+BATCH=20
 BATCH_SLEEP=5
 
 print_help() {
@@ -50,7 +50,7 @@ Options:
 EOF
 }
 
-# parse args
+# arg parse
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n) NUM="$2"; shift 2;;
@@ -71,52 +71,36 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# sanity checks
+# sanity
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "Error: not inside a git repository." >&2
   exit 1
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "Error: you have uncommitted changes. Commit or stash them and re-run." >&2
-  exit 1
+# Resolve base commit
+if ! BASE_COMMIT=$(git rev-parse "$BASE" 2>/dev/null); then
+  echo "Base branch '$BASE' not found locally. Attempting to fetch from $REMOTE..."
+  git fetch "$REMOTE" "$BASE":"$BASE" || { echo "Failed to fetch base $BASE"; exit 1; }
+  BASE_COMMIT=$(git rev-parse "$BASE") || { echo "Failed to resolve base commit after fetch"; exit 1; }
 fi
-
-# ensure base exists locally (try to fetch if not)
-if ! git show-ref --verify --quiet "refs/heads/$BASE"; then
-  echo "Base branch '$BASE' not found locally — attempting to fetch from remote '$REMOTE'..."
-  git fetch "$REMOTE" "$BASE":"$BASE" || {
-    echo "Failed to fetch base branch '$BASE' from remote '$REMOTE'." >&2
-    exit 1
-  }
-fi
-
-BASE_COMMIT=$(git rev-parse "$BASE") || { echo "Failed to resolve base branch '$BASE'"; exit 1; }
-echo "Using base branch '$BASE' -> $BASE_COMMIT"
+BASE_TREE=$(git rev-parse "$BASE":"$INFO_FILE" >/dev/null 2>&1 && echo "unused" || true) # noop - just clarity
 
 END=$(( START + NUM - 1 ))
 echo "Target branches: ${PREFIX}${START} .. ${PREFIX}${END}"
+
 if $DRY_RUN; then
-  echo "(dry-run) Will create (or push existing) branches:"
+  echo "(dry-run) Would create branches and commits (no changes made):"
   for ((i=START;i<=END;i++)); do
-    echo "  - ${PREFIX}${i}"
+    BR="${PREFIX}${i}"
+    MSG="${COMMIT_MSG//\{\{BRANCH\}\}/$BR}"
+    echo "  - $BR  -> commit msg: \"$MSG\"  -> file: $INFO_FILE"
   done
   exit 0
 fi
 
-# record original branch to restore later
-ORIG_BRANCH=$(git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD)
-cleanup() {
-  echo "Restoring original branch: $ORIG_BRANCH"
-  # try normal switch first, else detach to the commit
-  git switch --quiet "$ORIG_BRANCH" || git switch --detach "$ORIG_BRANCH" || true
-}
-trap cleanup EXIT
-
-# Helper: check if remote has branch
+# helper: check remote branch existence
 remote_has_branch() {
   local br="$1"
-  # ls-remote returns something if branch exists
   if git ls-remote --heads "$REMOTE" "refs/heads/$br" | grep -q .; then
     return 0
   else
@@ -124,16 +108,14 @@ remote_has_branch() {
   fi
 }
 
-# Helper: push a branch with retries
+# helper: push with retries (no set -e escape; we handle return codes)
 push_branch_with_retries() {
   local br="$1"
   local tries=0
-
   while (( tries < RETRIES )); do
     ((tries++))
     echo "  push attempt $tries/$RETRIES for $br ..."
-    # push & set upstream if not set; we push the local branch ref to remote
-    if git push --set-upstream "$REMOTE" "$br" >/dev/null 2>&1; then
+    if git push --set-upstream "$REMOTE" "refs/heads/$br:refs/heads/$br" >/dev/null 2>&1; then
       echo "    pushed: $REMOTE/$br"
       return 0
     else
@@ -141,22 +123,18 @@ push_branch_with_retries() {
       sleep "$DELAY"
     fi
   done
-
   echo "  All $RETRIES push attempts failed for $br — will continue and you can retry later." >&2
   return 1
 }
-
-# Make sure we start from the base
-git switch --quiet "$BASE"
 
 push_count=0
 
 for ((i=START;i<=END;i++)); do
   BR="${PREFIX}${i}"
 
+  # If local branch exists, we will not recreate it; we will try to push if requested and remote missing
   if git show-ref --verify --quiet "refs/heads/$BR"; then
     echo "Local branch exists: $BR"
-    # local exists -> ensure it has a commit (it should). If remote missing and user asked to push, attempt push.
     if $PUSH; then
       if remote_has_branch "$BR"; then
         echo "  remote already has $BR, skipping push."
@@ -168,31 +146,46 @@ for ((i=START;i<=END;i++)); do
     else
       echo "  (not pushing; use --push to push branches)"
     fi
-    # continue to next branch (do not create/recreate)
+    # next
     continue
   fi
 
-  # branch does not exist locally -> create it, commit unique metadata, then push if requested
-  echo "Creating branch '$BR' from '$BASE'..."
-  git switch -c "$BR" "$BASE"
+  echo "Creating branch '$BR' (commit created without checkout) from commit $BASE_COMMIT ..."
 
-  TOKEN=$(head -c 12 /dev/urandom | od -An -t x1 | tr -d ' \n')
-  echo "branch: $BR" > "$INFO_FILE"
-  echo "base: $BASE" >> "$INFO_FILE"
-  echo "created_at: $(date --utc +"%Y-%m-%dT%H:%M:%SZ")" >> "$INFO_FILE"
-  echo "token: $TOKEN" >> "$INFO_FILE"
+  # Create a temporary index and write tree with new .branch-info
+  TMP_INDEX="$(mktemp)"
+  export GIT_INDEX_FILE="$TMP_INDEX"
 
-  git add --force "$INFO_FILE"
+  # populate index with base commit tree
+  git read-tree "$BASE_COMMIT" >/dev/null
+
+  # create metadata file content in a temp file
+  TOK=$(head -c 12 /dev/urandom | od -An -t x1 | tr -d ' \n')
+  CREATED_AT=$(date --utc +"%Y-%m-%dT%H:%M:%SZ")
+  printf 'branch: %s\nbase: %s\ncreated_at: %s\ntoken: %s\n' "$BR" "$BASE" "$CREATED_AT" "$TOK" > "$INFO_FILE.tmp"
+
+  # write blob and add to index
+  BLOB_HASH=$(git hash-object -w "$INFO_FILE.tmp")
+  # ensure index sees it
+  git update-index --add --cacheinfo 100644 "$BLOB_HASH" "$INFO_FILE" >/dev/null
+
+  # write-tree to get new tree object
+  TREE_HASH=$(git write-tree)
+
+  # prepare commit message and create commit with parent = base commit
   COMMIT_MSG_ACTUAL="${COMMIT_MSG//\{\{BRANCH\}\}/$BR}"
+  COMMIT_HASH=$(echo "$COMMIT_MSG_ACTUAL" | git commit-tree "$TREE_HASH" -p "$BASE_COMMIT" --author="$AUTHOR_NAME <$AUTHOR_EMAIL>")
 
-  GIT_AUTHOR_NAME="$AUTHOR_NAME" \
-  GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" \
-  GIT_COMMITTER_NAME="$AUTHOR_NAME" \
-  GIT_COMMITTER_EMAIL="$AUTHOR_EMAIL" \
-  git commit -m "$COMMIT_MSG_ACTUAL" --no-verify >/dev/null
+  # create branch ref pointing to new commit
+  git update-ref "refs/heads/$BR" "$COMMIT_HASH"
 
-  echo "  committed on $BR: $INFO_FILE (token $TOKEN)"
+  echo "  created branch $BR -> commit $COMMIT_HASH (token $TOK)"
 
+  # cleanup temp index and file
+  unset GIT_INDEX_FILE
+  rm -f "$TMP_INDEX" "$INFO_FILE.tmp"
+
+  # If push requested, attempt it
   if $PUSH; then
     echo "  pushing $BR -> $REMOTE/$BR ..."
     if push_branch_with_retries "$BR"; then
@@ -201,17 +194,14 @@ for ((i=START;i<=END;i++)); do
     sleep "$DELAY"
   fi
 
-  # switch back to base to start next iteration cleanly
-  git switch --quiet "$BASE"
-
-  # occasional longer pause to avoid hitting rate limits
+  # batch sleep to avoid hitting remote rate limits
   if (( push_count > 0 && (push_count % BATCH) == 0 )); then
     echo "Completed $push_count pushes so far — sleeping ${BATCH_SLEEP}s to reduce rate-limit risk..."
     sleep "$BATCH_SLEEP"
   fi
 done
 
-echo "Done. Processed branches: ${PREFIX}${START} .. ${PREFIX}${END}"
+echo "Done. Created/processed branches: ${PREFIX}${START} .. ${PREFIX}${END}"
 if $PUSH; then
   echo "Attempted pushes: $push_count"
   echo "Branches that failed to push (if any) remain as local branches and will be retried on the next run."

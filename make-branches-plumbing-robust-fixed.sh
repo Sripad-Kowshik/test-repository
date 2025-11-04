@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# make-branches-plumbing-robust.sh
-# Create many dummy branches (unique commit per branch) without checkouts.
-# Robust: per-branch failures won't abort the whole run. Supports --push with retries.
+# make-branches-plumbing-robust-fixed.sh
+# Robust plumbing branch creator with safe cleanup (fixes unbound GIT_INDEX_FILE issue).
 set -euo pipefail
 
 NUM=200
@@ -149,6 +148,7 @@ for ((i=START;i<=END;i++)); do
     # prepare temp files and ensure cleanup within subshell
     TMP_INDEX="$(mktemp)"
     TMP_META="$(mktemp)"
+    # use a subshell-local GIT_INDEX_FILE; parent not affected
     export GIT_INDEX_FILE="$TMP_INDEX"
 
     # populate index with base commit's tree (use commit^{tree} to avoid errors)
@@ -181,7 +181,7 @@ for ((i=START;i<=END;i++)); do
 
     # cleanup temp index and meta file inside subshell
     unset GIT_INDEX_FILE
-    rm -f "$TMP_INDEX" "$TMP_META"
+    rm -f "$TMP_INDEX" "$TMP_META" || true
 
     # attempt push if requested
     if $PUSH; then
@@ -207,8 +207,12 @@ for ((i=START;i<=END;i++)); do
     # subshell failed
     echo "FAILED: $BR (see $FAILED_LOG)"
     echo "$BR" >> "$FAILED_LOG"
-    # attempt to cleanup any leftover temp artifacts in case subshell left them (best-effort)
-    rm -f "$GIT_INDEX_FILE" 2>/dev/null || true
+
+    # try safe cleanup of any tmp index file if left in environment
+    if [ -n "${GIT_INDEX_FILE-}" ]; then
+      rm -f "${GIT_INDEX_FILE}" 2>/dev/null || true
+    fi
+
     # continue to next branch (do not exit)
     continue
   fi
